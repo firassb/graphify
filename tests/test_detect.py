@@ -1921,6 +1921,91 @@ def test_detect_incremental_portable_across_paths(tmp_path):
     )
 
 
+def _rewrite_manifest_keys_nfd(manifest_path):
+    """Rewrite a saved manifest so every key is in NFD form, simulating a
+    manifest written by a macOS run where os.walk/getcwd yielded decomposed
+    paths (#2221). Returns the rewritten key list for sanity checks."""
+    import json
+    p = Path(manifest_path)
+    raw = json.loads(p.read_text(encoding="utf-8"))
+    nfd = {unicodedata.normalize("NFD", k): v for k, v in raw.items()}
+    p.write_text(json.dumps(nfd), encoding="utf-8")
+    return list(nfd)
+
+
+def test_manifest_nfc_keys_survive_macos_path_forms(tmp_path):
+    """#2221 (portable/relative-key manifest): a manifest whose keys were
+    written in NFD (macOS os.walk form) must still match an NFC scan, so
+    --update reports nothing new/changed/deleted instead of re-extracting
+    the whole corpus.
+
+    NOTE: the fixture filename must contain a character that actually
+    decomposes under NFD ("é" in "café" does, as do "ä" and "й"). Plain
+    Cyrillic like "заметка" has no decomposition, so NFC == NFD and the
+    test would pass vacuously even without the fix. Keep the byte-wise
+    inequality assertion below when changing the fixture name.
+    """
+    corpus = tmp_path / "corpus"
+    (corpus / "docs").mkdir(parents=True)
+    nfc_name = unicodedata.normalize("NFC", "café.md")
+    assert nfc_name != unicodedata.normalize("NFD", nfc_name)  # must decompose
+    (corpus / "docs" / nfc_name).write_text("hello unicode\n")
+
+    # Manifest lives OUTSIDE the corpus so it never enters the scan.
+    manifest_path = str(tmp_path / "out" / "manifest.json")
+    full = detect(corpus)
+    assert full["total_files"] == 1  # sanity: the café file was scanned
+    save_manifest(full["files"], manifest_path, root=corpus)
+
+    # Simulate the macOS-written manifest: keys stored in NFD form.
+    nfd_keys = _rewrite_manifest_keys_nfd(manifest_path)
+    # Sanity: the on-disk keys are genuinely decomposed, not silently NFC.
+    assert any(unicodedata.normalize("NFC", k) != k for k in nfd_keys)
+
+    inc = detect_incremental(corpus, manifest_path)
+    assert inc["new_total"] == 0, (
+        f"NFD manifest keys must match NFC scan paths (#2221); "
+        f"new_files={inc['new_files']}"
+    )
+    assert all(v == [] for v in inc["new_files"].values())
+    assert inc["deleted_files"] == [], (
+        f"NFD keys misreported as deletions: {inc['deleted_files']}"
+    )
+    assert inc["excluded_files"] == []
+
+
+def test_manifest_nfc_keys_legacy_absolute(tmp_path):
+    """#2221 exact repro: legacy manifest saved WITHOUT root (absolute keys),
+    then rewritten to NFD. Before the load_manifest/detect_incremental NFC
+    normalization, every file looked simultaneously new AND deleted on
+    --update.
+
+    NOTE: as above, the filename must contain an NFD-decomposable character
+    ("é"); a non-decomposing name would make this test vacuous.
+    """
+    corpus = tmp_path / "corpus"
+    (corpus / "docs").mkdir(parents=True)
+    nfc_name = unicodedata.normalize("NFC", "café.md")
+    assert nfc_name != unicodedata.normalize("NFD", nfc_name)  # must decompose
+    (corpus / "docs" / nfc_name).write_text("hello unicode\n")
+
+    manifest_path = str(tmp_path / "out" / "manifest.json")
+    full = detect(corpus)
+    assert full["total_files"] == 1
+    # No root= -> legacy absolute-keyed manifest format.
+    save_manifest(full["files"], manifest_path)
+
+    _rewrite_manifest_keys_nfd(manifest_path)
+
+    inc = detect_incremental(corpus, manifest_path)
+    assert inc["new_total"] == 0, (
+        f"legacy absolute NFD keys must match NFC scan (#2221); "
+        f"new_files={inc['new_files']}"
+    )
+    assert inc["deleted_files"] == []
+    assert inc["excluded_files"] == []
+
+
 def test_save_manifest_in_root_symlink_roundtrips(tmp_path):
     """In-root symlinks must store under the symlink's own name, not the
     resolved target. Resolving the key when relativizing pointed the stored
@@ -2445,3 +2530,42 @@ def test_sensitive_bare_keyword_prose_still_dropped():
     assert _is_sensitive(Path("secrets.md"))
     assert _is_sensitive(Path("token.rst"))
     assert not _is_sensitive(Path("token-lifecycle.md"))  # multi-word slug indexed
+
+
+# ── #2232 / #2184: committed dotenv templates (.env.example etc.) are graphable ──
+
+@pytest.mark.parametrize("path", [
+    ".env.example",
+    ".env.sample",
+    ".env.template",
+    ".env.dist",
+    ".ENV.EXAMPLE",              # case-insensitive, real on macOS/Windows
+    ".envrc.sample",             # direnv template
+    ".env.production.example",   # per-environment template
+])
+def test_sensitive_filter_indexes_env_templates(path):
+    """Placeholder-only committed templates must not be treated as live secrets."""
+    assert not _is_sensitive(Path(path)), f"{path} is a committed template, must be indexed (#2184)"
+
+
+@pytest.mark.parametrize("path", [
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".envrc",
+    ".env.example.local",   # template suffix not final -> a real local override
+    ".env.example.bak",     # backup of a (possibly filled-in) env file
+])
+def test_sensitive_filter_still_excludes_real_env_files(path):
+    """The template carve-out is suffix-anchored; live env files stay excluded."""
+    assert _is_sensitive(Path(path)), f"{path} is a live env file, must stay excluded (#2184)"
+
+
+@pytest.mark.parametrize("path", [
+    "secrets/.env.example",
+    "deploy/credentials/.env.example",
+])
+def test_sensitive_env_template_inside_secrets_dir_still_dropped(path):
+    """Stage 1 dir guard runs before the Stage 2 template exemption: anything
+    under a secrets/credentials dir stays excluded, template suffix or not."""
+    assert _is_sensitive(Path(path)), f"{path} is under a secrets dir, must stay excluded (#2184)"

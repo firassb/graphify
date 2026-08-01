@@ -215,7 +215,7 @@ except Exception as exc:
 # requires Python, so we let Python do the detaching: a tiny outer process spawns
 # the real rebuild fully detached and returns immediately, so the hook never
 # blocks. POSIX uses start_new_session (the setsid equivalent); Windows uses
-# DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, breaking away from any job object
+# CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP, breaking away from any job object
 # when allowed. This payload is carried inside a shell double-quoted -c argument,
 # so it deliberately uses only single-quoted Python strings (no ", $, ` or \\).
 _LAUNCHER_TEMPLATE = """\
@@ -232,7 +232,7 @@ except OSError:
 _kw = dict(stdout=_out, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, cwd=os.getcwd(), close_fds=True)
 _cmd = [sys.executable, '-c', _src]
 if os.name == 'nt':
-    _flags = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+    _flags = 0x08000000 | 0x00000200  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
     try:
         subprocess.Popen(_cmd, creationflags=_flags | 0x01000000, **_kw)  # + CREATE_BREAKAWAY_FROM_JOB
     except OSError:
@@ -503,10 +503,17 @@ def _pinned_python() -> str:
     that is not a valid plain filesystem path character, preventing $(...),
     backtick, double-quote, semicolon, etc. from being injected into generated
     shell scripts or the merge-driver command line. The allowlist includes ':'
-    and '\\' so Windows paths (C:\\...) are accepted. An empty return means
-    callers must fall back to the `graphify` launcher on PATH — safe degradation.
+    and '\\' so Windows paths (C:\\...) are accepted, and a plain space so
+    Windows profile paths (C:\\Users\\First Last\\...) are too — a space cannot
+    start a substitution or a new command, and every consumer quotes the value:
+    the hook scripts embed it as '$_PINNED' (single-quoted, then referenced as
+    "$_PINNED") and _register_merge_driver double-quotes it (#2166). Before that
+    a space rejected the whole path, so hooks installed under any Windows user
+    whose profile name contains a space silently pinned nothing. An empty return
+    means callers must fall back to the `graphify` launcher on PATH — safe
+    degradation.
     """
-    if re.search(r"[^a-zA-Z0-9/_.@:\\-]", sys.executable):
+    if re.search(r"[^a-zA-Z0-9/_.@: \\-]", sys.executable):
         return ""
     return sys.executable
 
@@ -551,7 +558,12 @@ def _register_merge_driver(root: Path) -> str:
     import subprocess as _sp
     pinned = _pinned_python()
     if pinned:
-        driver = f"{pinned} -m graphify merge-driver %O %A %B"
+        # Double-quoted: the allowlist in _pinned_python() permits a space (Windows
+        # profile paths), and git runs this driver string through a shell, so an
+        # unquoted "C:\\Users\\First Last\\...\\python.exe" would split into two
+        # words and the driver would never run (#2166). The same allowlist keeps
+        # '$' and backticks out, so double quotes cannot introduce expansion.
+        driver = f'"{pinned}" -m graphify merge-driver %O %A %B'
     else:
         driver = "graphify merge-driver %O %A %B"
     try:
